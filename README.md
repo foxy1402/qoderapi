@@ -119,11 +119,18 @@ CORS is enabled by default.
 | `QODER_PORT` | No | `8963` | Bind port |
 | `DASHBOARD_ENABLED` | No | `true` | Enable/disable dashboard routes |
 | `QODER_API_KEY` | No | falls back to `QODER_PAT` | Proxy API auth key |
+| `TOOL_MODE` | No | `auto` | Tool-call compatibility mode: `off`, `auto`, `passthrough` |
 | `DASHBOARD_PASSWORD` | No | unset | Single dashboard password |
 | `DASHBOARD_PASSWORDS` | No | unset | Multiple dashboard passwords (comma-separated) |
 | `CORS_ENABLED` | No | `true` | Enable/disable CORS headers and preflight |
 | `CORS_ALLOW_ORIGIN` | No | `*` | Value for `Access-Control-Allow-Origin` |
 | `QODER_DEBUG_LOG` | No | `false` | Verbose message-level bridge logs |
+
+### Tool Mode
+
+- `off`: never emit `tool_calls`; always return text completion shape.
+- `auto` (recommended): emit `tool_calls` only when request includes a non-empty `tools` array.
+- `passthrough`: forward tool-call behavior even without client-provided `tools`.
 
 ## Example Requests
 

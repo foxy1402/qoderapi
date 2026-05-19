@@ -28,6 +28,8 @@ public final class OpenAiBridge {
     private static final ObjectMapper objectMapper = new ObjectMapper();
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(ZoneOffset.UTC);
     private static final int LOG_LIMIT = 300;
+    private static final String CHUNK_TRUNCATION_1 = "premature end of chunk";
+    private static final String CHUNK_TRUNCATION_2 = "closing chunk expected";
     private final BearerBuilder.SessionContext sess;
     private final BearerApiClient bearerClient;
     private final JsonNode templateBase;
@@ -38,6 +40,13 @@ public final class OpenAiBridge {
     private final String corsAllowOrigin = getSettingOrDefault("CORS_ALLOW_ORIGIN", "*");
     private final String proxyApiKey;
     private final List<String> dashboardPasswords = resolveDashboardPasswords();
+    private final ToolMode toolMode = resolveToolMode();
+
+    private enum ToolMode {
+        OFF,
+        AUTO,
+        PASSTHROUGH
+    }
 
     public OpenAiBridge(String pat) throws Exception {
         String explicitApiKey = getSetting("QODER_API_KEY");
@@ -59,7 +68,7 @@ public final class OpenAiBridge {
         basePrompt = basePrompt.replace("{UUID5}", UUID.randomUUID().toString());
         basePrompt = basePrompt.replace("{TIME1}", String.valueOf(System.currentTimeMillis()));
         this.templateBase = objectMapper.readTree(basePrompt);
-        logSystem("Bridge initialized for user=" + jt.path("id").asText() + " dashboardEnabled=" + dashboardEnabled + " corsEnabled=" + corsEnabled + " apiKeyAuth=" + (proxyApiKey != null && !proxyApiKey.isBlank()));
+        logSystem("Bridge initialized for user=" + jt.path("id").asText() + " dashboardEnabled=" + dashboardEnabled + " corsEnabled=" + corsEnabled + " apiKeyAuth=" + (proxyApiKey != null && !proxyApiKey.isBlank()) + " toolMode=" + toolMode.name().toLowerCase());
     }
 
     public void start(int port) throws Exception {
@@ -151,6 +160,7 @@ public final class OpenAiBridge {
             info.put("endpoint_base_path", "/v1");
             info.put("endpoint_path", "/v1/chat/completions");
             info.put("proxy_api_key", proxyApiKey == null ? "" : proxyApiKey);
+            info.put("tool_mode", toolMode.name().toLowerCase());
             info.put("model_note", "Model selector hidden. Bridge does not strictly enforce model IDs.");
             writeJson(ex, 200, info);
         } finally {
@@ -197,6 +207,8 @@ public final class OpenAiBridge {
         boolean streamForLog = false;
         int messageCountForLog = 0;
         int toolCountForLog = 0;
+        OutputStream streamOut = null;
+        boolean streamResponseStarted = false;
         try {
             if (handleCorsPreflight(ex)) {
                 return;
@@ -212,7 +224,20 @@ public final class OpenAiBridge {
                 appendRequestLog("unauthorized path=" + ex.getRequestURI().getPath());
                 return;
             }
-            JsonNode req = objectMapper.readTree(ex.getRequestBody());
+            JsonNode req;
+            try {
+                req = objectMapper.readTree(ex.getRequestBody());
+            } catch (Exception parseErr) {
+                writeOpenAiError(ex, 400, "invalid_request_error", "Invalid JSON request body", null, "invalid_json");
+                appendRequestLog("bad_request invalid_json");
+                return;
+            }
+            String requestValidationError = validateChatRequest(req);
+            if (requestValidationError != null) {
+                writeOpenAiError(ex, 400, "invalid_request_error", requestValidationError, "messages", "invalid_messages");
+                appendRequestLog("bad_request invalid_messages reason=" + requestValidationError);
+                return;
+            }
             boolean stream = req.path("stream").asBoolean(false);
             String model = req.path("model").asText("lite");
             JsonNode messages = req.path("messages");
@@ -241,6 +266,7 @@ public final class OpenAiBridge {
             biz.put("name", prompt.length() > 30 ? prompt.substring(0, 30) : prompt);
             JsonNode incomingTools = req.path("tools");
             boolean toolsEnabled = incomingTools.isArray() && incomingTools.size() > 0;
+            boolean allowToolCallsInResponse = allowsToolCallsInResponse(toolsEnabled);
             toolCountForLog = incomingTools != null && incomingTools.isArray() ? incomingTools.size() : 0;
             body.set("messages", buildQoderMessages((ArrayNode) body.path("messages"), messages, prompt, toolsEnabled));
             if (toolsEnabled) {
@@ -249,7 +275,7 @@ public final class OpenAiBridge {
 
             int messageCount = messageCountForLog;
             int toolCount = toolCountForLog;
-            System.out.println("[bridge] request model=" + model + " stream=" + stream + " messages=" + messageCount + " tools=" + toolCount + " prompt_chars=" + prompt.length());
+            System.out.println("[bridge] request model=" + model + " stream=" + stream + " messages=" + messageCount + " tools=" + toolCount + " tool_mode=" + toolMode.name().toLowerCase() + " prompt_chars=" + prompt.length());
             if (isDebugLogEnabled()) {
                 for (JsonNode msg : body.path("messages")) {
                     String content = msg.path("content").asText();
@@ -270,8 +296,10 @@ public final class OpenAiBridge {
                 ex.getResponseHeaders().add("Cache-Control", "no-cache");
                 ex.sendResponseHeaders(200, 0);
                 OutputStream out = ex.getResponseBody();
-                StreamAccumulator accumulator = new StreamAccumulator(out, reqId, created, model, toolsEnabled);
-                bearerClient.openStreamLines(url, body, extraHeaders, line -> {
+                streamOut = out;
+                streamResponseStarted = true;
+                StreamAccumulator accumulator = new StreamAccumulator(out, reqId, created, model, allowToolCallsInResponse, allowToolCallsInResponse);
+                executeUpstreamLinesWithRetry(url, body, extraHeaders, line -> {
                     if (!line.startsWith("data:")) return;
                     BridgeDelta delta = extractDelta(line.substring(5).trim());
                     if (delta.isEmpty()) return;
@@ -292,19 +320,31 @@ public final class OpenAiBridge {
             } else {
                 StringBuilder full = new StringBuilder();
                 ToolCallAccumulator toolCalls = new ToolCallAccumulator();
-                bearerClient.openStreamLines(url, body, extraHeaders, line -> {
+                UsageAccumulator usageAccumulator = new UsageAccumulator();
+                executeUpstreamLinesWithRetry(url, body, extraHeaders, line -> {
                     if (!line.startsWith("data:")) return;
-                    BridgeDelta delta = extractDelta(line.substring(5).trim());
+                    String dataLine = line.substring(5).trim();
+                    usageAccumulator.capture(dataLine);
+                    BridgeDelta delta = extractDelta(dataLine);
                     if (delta.content() != null) {
                         full.append(delta.content());
                     }
                     if (delta.toolCalls() != null && delta.toolCalls().size() > 0) {
                         toolCalls.append(delta.toolCalls());
                     }
-                });
+                }, true, false);
+                ArrayNode collectedToolCalls = toolCalls.isEmpty() ? null : toolCalls.snapshot();
                 ArrayNode fallbackToolCalls = null;
-                if (toolCalls.isEmpty() && toolsEnabled) {
+                if (allowToolCallsInResponse && toolCalls.isEmpty()) {
                     fallbackToolCalls = parseToolCallsText(full.toString());
+                }
+                if (!allowToolCallsInResponse && full.isEmpty() && collectedToolCalls != null) {
+                    String recovered = recoverPlainTextFromUnexpectedToolCalls(url, body, extraHeaders);
+                    if (recovered != null && !recovered.isBlank()) {
+                        full.append(recovered);
+                    } else {
+                        full.append(buildToolModeFallbackMessage(collectedToolCalls));
+                    }
                 }
                 ObjectNode out = objectMapper.createObjectNode();
                 out.put("id", reqId);
@@ -316,26 +356,22 @@ public final class OpenAiBridge {
                 ch.put("index", 0);
                 ObjectNode msg = objectMapper.createObjectNode();
                 msg.put("role", "assistant");
-                if (fallbackToolCalls != null) {
-                    msg.putNull("content");
-                    msg.set("tool_calls", fallbackToolCalls);
-                } else if (full.isEmpty() && !toolCalls.isEmpty()) {
+                boolean hasToolCallOutput = allowToolCallsInResponse && (collectedToolCalls != null || fallbackToolCalls != null);
+                if (hasToolCallOutput) {
                     msg.putNull("content");
                 } else {
                     msg.put("content", full.toString());
                 }
-                if (!toolCalls.isEmpty()) {
-                    msg.set("tool_calls", toolCalls.snapshot());
+                if (allowToolCallsInResponse && collectedToolCalls != null) {
+                    msg.set("tool_calls", collectedToolCalls);
+                } else if (allowToolCallsInResponse && fallbackToolCalls != null) {
+                    msg.set("tool_calls", fallbackToolCalls);
                 }
                 ch.set("message", msg);
-                ch.put("finish_reason", (!toolCalls.isEmpty() || fallbackToolCalls != null) ? "tool_calls" : "stop");
+                ch.put("finish_reason", hasToolCallOutput ? "tool_calls" : "stop");
                 choices.add(ch);
                 out.set("choices", choices);
-                ObjectNode usage = objectMapper.createObjectNode();
-                usage.put("prompt_tokens", 0);
-                usage.put("completion_tokens", 0);
-                usage.put("total_tokens", 0);
-                out.set("usage", usage);
+                out.set("usage", usageAccumulator.snapshot());
                 byte[] outBytes = objectMapper.writeValueAsBytes(out);
                 applyCors(ex);
                 ex.getResponseHeaders().add("Content-Type", "application/json");
@@ -345,19 +381,14 @@ public final class OpenAiBridge {
             }
         } catch (Exception e) {
             String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-            ObjectNode error = objectMapper.createObjectNode();
-            ObjectNode payload = objectMapper.createObjectNode();
-            payload.put("message", message);
-            payload.put("type", "qoder_error");
-            error.set("error", payload);
-            byte[] errBytes = objectMapper.writeValueAsBytes(error);
             logSystem("chat_error model=" + modelForLog + " stream=" + streamForLog + " error=" + message);
             appendRequestLog("error model=" + modelForLog + " stream=" + streamForLog + " messages=" + messageCountForLog + " tools=" + toolCountForLog + " error=" + message);
             try {
-                applyCors(ex);
-                ex.getResponseHeaders().add("Content-Type", "application/json");
-                ex.sendResponseHeaders(500, errBytes.length);
-                ex.getResponseBody().write(errBytes);
+                if (streamResponseStarted && streamOut != null) {
+                    writeSseError(streamOut, message);
+                } else {
+                    writeOpenAiError(ex, 500, "server_error", message, null, "upstream_error");
+                }
             } catch (IOException ignore) {
             }
         } finally {
@@ -386,6 +417,132 @@ public final class OpenAiBridge {
         } catch (Exception ignore) {
         }
         return BridgeDelta.empty();
+    }
+
+    private String validateChatRequest(JsonNode req) {
+        if (req == null || !req.isObject()) {
+            return "Request body must be a JSON object";
+        }
+        JsonNode messages = req.path("messages");
+        if (!messages.isArray() || messages.isEmpty()) {
+            return "Field 'messages' must be a non-empty array";
+        }
+        for (int i = 0; i < messages.size(); i++) {
+            JsonNode msg = messages.get(i);
+            if (!msg.isObject()) {
+                return "Each item in 'messages' must be an object";
+            }
+            String role = msg.path("role").asText("");
+            if (role.isBlank()) {
+                return "Each message must include a non-empty 'role'";
+            }
+        }
+        JsonNode tools = req.path("tools");
+        if (!tools.isMissingNode() && !tools.isNull() && !tools.isArray()) {
+            return "Field 'tools' must be an array when provided";
+        }
+        return null;
+    }
+
+    private void writeSseError(OutputStream out, String message) throws IOException {
+        ObjectNode error = objectMapper.createObjectNode();
+        ObjectNode payload = objectMapper.createObjectNode();
+        payload.put("message", message);
+        payload.put("type", "server_error");
+        payload.putNull("param");
+        payload.put("code", "upstream_error");
+        error.set("error", payload);
+        out.write(("data: " + objectMapper.writeValueAsString(error) + "\n\n").getBytes(StandardCharsets.UTF_8));
+        out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+    }
+
+    private boolean allowsToolCallsInResponse(boolean requestHasTools) {
+        return switch (toolMode) {
+            case OFF -> false;
+            case AUTO -> requestHasTools;
+            case PASSTHROUGH -> true;
+        };
+    }
+
+    private void executeUpstreamLinesWithRetry(String url, ObjectNode body, Map<String, String> extraHeaders, java.util.function.Consumer<String> onLine) throws Exception {
+        executeUpstreamLinesWithRetry(url, body, extraHeaders, onLine, true, true);
+    }
+
+    private void executeUpstreamLinesWithRetry(String url, ObjectNode body, Map<String, String> extraHeaders, java.util.function.Consumer<String> onLine, boolean retryOnChunkTruncation, boolean onlyRetryIfNoLines) throws Exception {
+        int maxAttempts = retryOnChunkTruncation ? 2 : 1;
+        Exception last = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            final boolean[] sawLines = {false};
+            try {
+                bearerClient.openStreamLines(url, body, extraHeaders, line -> {
+                    sawLines[0] = true;
+                    onLine.accept(line);
+                });
+                return;
+            } catch (Exception e) {
+                last = e;
+                boolean canRetry = retryOnChunkTruncation && attempt < maxAttempts && isChunkTruncationError(e) && (!onlyRetryIfNoLines || !sawLines[0]);
+                if (!canRetry) {
+                    throw e;
+                }
+                logSystem("upstream_chunk_truncated retrying attempt=" + attempt + " of " + maxAttempts);
+                try {
+                    Thread.sleep(200L);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+        if (last != null) {
+            throw last;
+        }
+    }
+
+    private String recoverPlainTextFromUnexpectedToolCalls(String url, ObjectNode body, Map<String, String> extraHeaders) throws Exception {
+        ObjectNode retryBody = body.deepCopy();
+        retryBody.remove("tools");
+        ArrayNode retryMessages = objectMapper.createArrayNode();
+        JsonNode existing = retryBody.path("messages");
+        if (existing.isArray()) {
+            for (JsonNode msg : existing) {
+                retryMessages.add(msg.deepCopy());
+            }
+        }
+        retryMessages.add(buildUserMessage("Compatibility mode: answer directly as plain text. Do not call tools and do not output tool call JSON."));
+        retryBody.set("messages", retryMessages);
+        StringBuilder recovered = new StringBuilder();
+        executeUpstreamLinesWithRetry(url, retryBody, extraHeaders, line -> {
+            if (!line.startsWith("data:")) return;
+            BridgeDelta delta = extractDelta(line.substring(5).trim());
+            if (delta.content() != null) {
+                recovered.append(delta.content());
+            }
+        }, true, false);
+        return recovered.toString();
+    }
+
+    private String buildToolModeFallbackMessage(ArrayNode toolCalls) {
+        String summary = summarizeUnresolvedToolCalls(toolCalls);
+        return "Tool calls are disabled for this request mode. " + summary;
+    }
+
+    private boolean isChunkTruncationError(Exception e) {
+        if (e == null) {
+            return false;
+        }
+        Throwable cur = e;
+        while (cur != null) {
+            String msg = cur.getMessage();
+            if (msg != null) {
+                String lower = msg.toLowerCase();
+                if (lower.contains(CHUNK_TRUNCATION_1) || lower.contains(CHUNK_TRUNCATION_2)) {
+                    return true;
+                }
+            }
+            cur = cur.getCause();
+        }
+        return false;
     }
 
     private String extractLatestUserPrompt(JsonNode messages) {
@@ -662,7 +819,8 @@ public final class OpenAiBridge {
                 continue;
             }
             ObjectNode call = objectMapper.createObjectNode();
-            call.put("id", rawToolCall.path("id").asText(""));
+            String rawId = rawToolCall.path("id").asText("");
+            call.put("id", rawId.isBlank() ? generateToolCallId() : rawId);
             call.put("type", rawToolCall.path("type").asText("function"));
             ObjectNode normalizedFunction = objectMapper.createObjectNode();
             normalizedFunction.put("name", name);
@@ -773,18 +931,21 @@ public final class OpenAiBridge {
         private final String reqId;
         private final long created;
         private final String model;
+        private final boolean allowToolCallOutput;
         private final boolean toolCallFallbackEnabled;
         private final ToolCallAccumulator toolCalls = new ToolCallAccumulator();
+        private final ToolCallAccumulator blockedToolCalls = new ToolCallAccumulator();
         private final StringBuilder pendingContent = new StringBuilder();
         private String pendingRole = "assistant";
         private boolean emittedChunk;
         private boolean streamingText;
 
-        private StreamAccumulator(OutputStream out, String reqId, long created, String model, boolean toolCallFallbackEnabled) {
+        private StreamAccumulator(OutputStream out, String reqId, long created, String model, boolean allowToolCallOutput, boolean toolCallFallbackEnabled) {
             this.out = out;
             this.reqId = reqId;
             this.created = created;
             this.model = model;
+            this.allowToolCallOutput = allowToolCallOutput;
             this.toolCallFallbackEnabled = toolCallFallbackEnabled;
         }
 
@@ -793,6 +954,10 @@ public final class OpenAiBridge {
                 pendingRole = delta.role();
             }
             if (delta.toolCalls() != null && delta.toolCalls().size() > 0) {
+                if (!allowToolCallOutput) {
+                    blockedToolCalls.append(delta.toolCalls());
+                    return;
+                }
                 discardBufferedToolCallText();
                 toolCalls.append(delta.toolCalls());
                 emit(null, withToolCallIndices(delta.toolCalls()));
@@ -817,6 +982,10 @@ public final class OpenAiBridge {
         }
 
         private void flush() throws IOException {
+            if (!allowToolCallOutput && !emittedChunk && !blockedToolCalls.isEmpty()) {
+                emit(buildToolModeFallbackMessage(blockedToolCalls.snapshot()), null);
+                return;
+            }
             if (pendingContent.length() == 0) {
                 return;
             }
@@ -882,6 +1051,9 @@ public final class OpenAiBridge {
                 if (!call.path("index").isInt()) {
                     call.put("index", i);
                 }
+                if (call.path("id").asText("").isBlank()) {
+                    call.put("id", generateToolCallId());
+                }
                 indexed.add(call);
             }
             return indexed;
@@ -896,7 +1068,7 @@ public final class OpenAiBridge {
                 int index = deltaCall.path("index").isInt() ? deltaCall.path("index").asInt() : calls.size();
                 while (calls.size() <= index) {
                     ObjectNode placeholder = objectMapper.createObjectNode();
-                    placeholder.put("id", "");
+                    placeholder.put("id", generateToolCallId());
                     placeholder.put("type", "function");
                     ObjectNode function = objectMapper.createObjectNode();
                     function.put("name", "");
@@ -907,10 +1079,16 @@ public final class OpenAiBridge {
 
                 ObjectNode existing = (ObjectNode) calls.get(index);
                 if (deltaCall.path("id").isTextual()) {
-                    existing.put("id", deltaCall.path("id").asText());
+                    String deltaId = deltaCall.path("id").asText();
+                    if (!deltaId.isBlank()) {
+                        existing.put("id", deltaId);
+                    }
                 }
                 if (deltaCall.path("type").isTextual()) {
-                    existing.put("type", deltaCall.path("type").asText());
+                    String deltaType = deltaCall.path("type").asText();
+                    if (!deltaType.isBlank()) {
+                        existing.put("type", deltaType);
+                    }
                 }
 
                 JsonNode deltaFunction = deltaCall.path("function");
@@ -931,6 +1109,50 @@ public final class OpenAiBridge {
         private ArrayNode snapshot() {
             return calls.deepCopy();
         }
+    }
+
+    private final class UsageAccumulator {
+        private int promptTokens;
+        private int completionTokens;
+        private int totalTokens;
+
+        private void capture(String dataLine) {
+            try {
+                JsonNode wrapper = objectMapper.readTree(dataLine);
+                String inner = wrapper.path("body").asText("");
+                if (inner.isEmpty()) {
+                    return;
+                }
+                JsonNode usage = objectMapper.readTree(inner).path("usage");
+                if (!usage.isObject()) {
+                    return;
+                }
+                if (usage.path("prompt_tokens").canConvertToInt()) {
+                    promptTokens = usage.path("prompt_tokens").asInt();
+                }
+                if (usage.path("completion_tokens").canConvertToInt()) {
+                    completionTokens = usage.path("completion_tokens").asInt();
+                }
+                if (usage.path("total_tokens").canConvertToInt()) {
+                    totalTokens = usage.path("total_tokens").asInt();
+                } else if (promptTokens > 0 || completionTokens > 0) {
+                    totalTokens = promptTokens + completionTokens;
+                }
+            } catch (Exception ignore) {
+            }
+        }
+
+        private ObjectNode snapshot() {
+            ObjectNode usage = objectMapper.createObjectNode();
+            usage.put("prompt_tokens", promptTokens);
+            usage.put("completion_tokens", completionTokens);
+            usage.put("total_tokens", totalTokens);
+            return usage;
+        }
+    }
+
+    private String generateToolCallId() {
+        return "call_" + UUID.randomUUID().toString().replace("-", "");
     }
 
     private void appendRequestLog(String message) {
@@ -997,12 +1219,7 @@ public final class OpenAiBridge {
     }
 
     private void writeAuthError(HttpExchange ex, String message) throws IOException {
-        ObjectNode error = objectMapper.createObjectNode();
-        ObjectNode payload = objectMapper.createObjectNode();
-        payload.put("message", message);
-        payload.put("type", "auth_error");
-        error.set("error", payload);
-        writeJson(ex, 401, error);
+        writeOpenAiError(ex, 401, "invalid_request_error", message, null, "invalid_api_key");
     }
 
     private boolean isDashboardAuthorized(HttpExchange ex) {
@@ -1014,12 +1231,7 @@ public final class OpenAiBridge {
     }
 
     private void writeDashboardAuthError(HttpExchange ex) throws IOException {
-        ObjectNode error = objectMapper.createObjectNode();
-        ObjectNode payload = objectMapper.createObjectNode();
-        payload.put("message", "Invalid or missing dashboard password");
-        payload.put("type", "dashboard_auth_error");
-        error.set("error", payload);
-        writeJson(ex, 401, error);
+        writeOpenAiError(ex, 401, "invalid_request_error", "Invalid or missing dashboard password", null, "dashboard_auth_error");
     }
 
     private List<String> resolveDashboardPasswords() {
@@ -1034,6 +1246,34 @@ public final class OpenAiBridge {
                 .map(String::trim)
                 .filter(s -> !s.isBlank())
                 .toList();
+    }
+
+    private ToolMode resolveToolMode() {
+        String raw = getSettingOrDefault("TOOL_MODE", "auto").trim().toLowerCase();
+        return switch (raw) {
+            case "off" -> ToolMode.OFF;
+            case "passthrough" -> ToolMode.PASSTHROUGH;
+            default -> ToolMode.AUTO;
+        };
+    }
+
+    private void writeOpenAiError(HttpExchange ex, int statusCode, String type, String message, String param, String code) throws IOException {
+        ObjectNode error = objectMapper.createObjectNode();
+        ObjectNode payload = objectMapper.createObjectNode();
+        payload.put("message", message == null ? "Unknown error" : message);
+        payload.put("type", type == null ? "server_error" : type);
+        if (param == null) {
+            payload.putNull("param");
+        } else {
+            payload.put("param", param);
+        }
+        if (code == null) {
+            payload.putNull("code");
+        } else {
+            payload.put("code", code);
+        }
+        error.set("error", payload);
+        writeJson(ex, statusCode, error);
     }
 
     private void writeJson(HttpExchange ex, int statusCode, JsonNode payload) throws IOException {
@@ -1151,7 +1391,7 @@ public final class OpenAiBridge {
                         <div style="width: 180px;"><button id="copyEndpoint">Copy Chat Endpoint</button></div>
                       </div>
                       <div class="row" style="margin-top: 8px;">
-                        <div class="grow"><input id="proxyKey" readonly></div>
+                        <div class="grow"><input id="proxyKey" placeholder="Enter API key for playground"></div>
                         <div style="width: 180px;"><button id="copyProxyKey">Copy API Key</button></div>
                       </div>
                       <div class="warn" style="margin-top: 10px;">
@@ -1212,7 +1452,7 @@ public final class OpenAiBridge {
                       const endpointPath = dashboardInfo.endpoint_path || '/v1/chat/completions';
                       document.getElementById('baseUrl').value = window.location.origin + basePath;
                       document.getElementById('chatEndpoint').value = window.location.origin + endpointPath;
-                      document.getElementById('proxyKey').value = dashboardInfo.proxy_api_key || '(not configured)';
+                      document.getElementById('proxyKey').value = dashboardInfo.proxy_api_key || '';
                     }
                     setEndpointPlaceholders();
 
@@ -1311,7 +1551,7 @@ public final class OpenAiBridge {
                       const prompt = document.getElementById('prompt').value.trim();
                       if (!prompt) return;
                       const headers = { 'Content-Type': 'application/json' };
-                      const proxyKey = dashboardInfo && dashboardInfo.proxy_api_key ? dashboardInfo.proxy_api_key : '';
+                      const proxyKey = document.getElementById('proxyKey').value.trim();
                       if (proxyKey) {
                         headers['Authorization'] = 'Bearer ' + proxyKey;
                       }
