@@ -1,6 +1,6 @@
 services:
   qoder2api:
-    image: ${QODER_IMAGE:-ghcr.io/your-org-or-user/qoderapi:latest}
+    image: ${QODER_IMAGE:-ghcr.io/foxy1402/qoderapi:latest}
     platform: linux/amd64
     pull_policy: always
     restart: unless-stopped

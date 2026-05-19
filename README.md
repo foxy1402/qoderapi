@@ -25,7 +25,7 @@ docker run -d \
   --name qoder2api \
   -p 8963:8963 \
   -e QODER_PAT=your-pat \
-  ghcr.io/your-org-or-user/qoderapi:latest
+  ghcr.io/foxy1402/qoderapi:latest
 ```
 
 ### Docker Compose
@@ -33,7 +33,7 @@ docker run -d \
 ```yaml
 services:
   qoder2api:
-    image: ${QODER_IMAGE:-ghcr.io/your-org-or-user/qoderapi:latest}
+    image: ${QODER_IMAGE:-ghcr.io/foxy1402/qoderapi:latest}
     ports:
       - "8963:8963"
     environment:
