@@ -62,6 +62,7 @@ This repo now includes GitHub Actions workflow:
 - `.github/workflows/ghcr-publish.yml`
 - Trigger: push to `main` or `master` (and manual dispatch)
 - Output image: `ghcr.io/<owner>/<repo>:latest`
+- Multi-arch publish: `linux/amd64` and `linux/arm64`
 
 After you create the GitHub repo, push this code and GitHub will publish the `latest` tag automatically using `GITHUB_TOKEN`.
 

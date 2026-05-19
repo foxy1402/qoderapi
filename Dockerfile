@@ -1,4 +1,7 @@
-# Build with: docker build --platform linux/amd64 -t qoderapi .
+# Local single-arch build:
+#   docker build --platform linux/amd64 -t qoderapi:local .
+# Multi-arch build (buildx example):
+#   docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/foxy1402/qoderapi:latest --push .
 ARG BUILDPLATFORM=linux/amd64
 
 FROM --platform=${BUILDPLATFORM} maven:3.9.9-eclipse-temurin-17-alpine AS build
