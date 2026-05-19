@@ -150,6 +150,7 @@ public final class OpenAiBridge {
             info.put("api_key_required", requiresProxyApiKey());
             info.put("endpoint_base_path", "/v1");
             info.put("endpoint_path", "/v1/chat/completions");
+            info.put("proxy_api_key", proxyApiKey == null ? "" : proxyApiKey);
             info.put("model_note", "Model selector hidden. Bridge does not strictly enforce model IDs.");
             writeJson(ex, 200, info);
         } finally {
@@ -1043,16 +1044,7 @@ public final class OpenAiBridge {
         ex.getResponseBody().write(bytes);
     }
 
-    private String jsonStringLiteral(String value) {
-        try {
-            return objectMapper.writeValueAsString(value == null ? "" : value);
-        } catch (Exception e) {
-            return "\"\"";
-        }
-    }
-
     private String dashboardHtml() {
-        String proxyKeyJson = jsonStringLiteral(proxyApiKey);
         String dashboardPasswordRequired = dashboardPasswords.isEmpty() ? "false" : "true";
         return ("""
                 <!doctype html>
@@ -1147,7 +1139,7 @@ public final class OpenAiBridge {
                       <div class="mini">Backend-only control panel. No persistent storage: config from env vars only.</div>
                     </div>
 
-                    <div class="card">
+                    <div class="card protected">
                       <h2>Endpoint</h2>
                       <div class="row">
                         <div class="grow"><input id="baseUrl" readonly></div>
@@ -1178,7 +1170,7 @@ public final class OpenAiBridge {
                       <div id="dashboardAuthStatus" class="mini" style="margin-top: 8px;"></div>
                     </div>
 
-                    <div class="card">
+                    <div class="card protected">
                       <h2>Playground</h2>
                       <textarea id="prompt" placeholder="Type a test prompt..."></textarea>
                       <div class="row" style="margin-top: 8px;">
@@ -1188,48 +1180,84 @@ public final class OpenAiBridge {
                       <pre id="response"></pre>
                     </div>
 
-                    <div class="card">
+                    <div class="card protected">
                       <h2>Request Logs</h2>
                       <pre id="requestLogs"></pre>
                     </div>
 
-                    <div class="card">
+                    <div class="card protected">
                       <h2>System Logs</h2>
                       <pre id="systemLogs"></pre>
                     </div>
                   </div>
 
                   <script>
-                    const apiBase = window.location.origin + '/v1';
-                    const endpoint = apiBase + '/chat/completions';
-                    const defaultProxyApiKey = __PROXY_API_KEY_JSON__;
                     const dashboardPasswordRequired = __DASHBOARD_PASSWORD_REQUIRED__;
                     let dashboardPassword = '';
+                    let dashboardUnlocked = !dashboardPasswordRequired;
+                    let dashboardInfo = null;
+                    const protectedCards = Array.from(document.querySelectorAll('.protected'));
 
-                    document.getElementById('baseUrl').value = apiBase;
-                    document.getElementById('chatEndpoint').value = endpoint;
-                    document.getElementById('proxyKey').value = defaultProxyApiKey || '(not configured)';
+                    function setProtectedVisible(visible) {
+                      protectedCards.forEach((el) => { el.style.display = visible ? '' : 'none'; });
+                    }
+                    function setEndpointPlaceholders() {
+                      document.getElementById('baseUrl').value = '(locked)';
+                      document.getElementById('chatEndpoint').value = '(locked)';
+                      document.getElementById('proxyKey').value = '(locked)';
+                    }
+                    function applyDashboardInfo(info) {
+                      dashboardInfo = info || {};
+                      const basePath = dashboardInfo.endpoint_base_path || '/v1';
+                      const endpointPath = dashboardInfo.endpoint_path || '/v1/chat/completions';
+                      document.getElementById('baseUrl').value = window.location.origin + basePath;
+                      document.getElementById('chatEndpoint').value = window.location.origin + endpointPath;
+                      document.getElementById('proxyKey').value = dashboardInfo.proxy_api_key || '(not configured)';
+                    }
+                    setEndpointPlaceholders();
 
                     async function copyText(text) {
                       try {
                         await navigator.clipboard.writeText(text);
                       } catch (err) {}
                     }
-                    document.getElementById('copyBaseUrl').onclick = () => copyText(apiBase);
-                    document.getElementById('copyEndpoint').onclick = () => copyText(endpoint);
-                    document.getElementById('copyProxyKey').onclick = () => copyText(defaultProxyApiKey || '');
+                    document.getElementById('copyBaseUrl').onclick = () => copyText(document.getElementById('baseUrl').value);
+                    document.getElementById('copyEndpoint').onclick = () => copyText(document.getElementById('chatEndpoint').value);
+                    document.getElementById('copyProxyKey').onclick = () => copyText(document.getElementById('proxyKey').value);
 
                     const dashboardAuthCard = document.getElementById('dashboardAuthCard');
                     const dashboardAuthStatus = document.getElementById('dashboardAuthStatus');
                     if (!dashboardPasswordRequired) {
                       dashboardAuthCard.style.display = 'none';
+                      setProtectedVisible(true);
                     } else {
+                      setProtectedVisible(false);
                       dashboardAuthStatus.textContent = 'Locked';
+                    }
+
+                    async function unlockDashboard() {
+                      try {
+                        const info = await getJson('/dashboard/api/info');
+                        applyDashboardInfo(info);
+                        dashboardUnlocked = true;
+                        setProtectedVisible(true);
+                        if (dashboardPasswordRequired) {
+                          dashboardAuthStatus.textContent = 'Unlocked';
+                        }
+                        await refreshLogs();
+                      } catch (err) {
+                        dashboardUnlocked = false;
+                        setProtectedVisible(false);
+                        setEndpointPlaceholders();
+                        if (dashboardPasswordRequired) {
+                          dashboardAuthStatus.textContent = 'Locked / wrong password';
+                        }
+                      }
                     }
 
                     document.getElementById('unlockDashboard').onclick = async () => {
                       dashboardPassword = document.getElementById('dashboardPassword').value.trim();
-                      await refreshLogs();
+                      await unlockDashboard();
                     };
 
                     function dashboardHeaders(base = {}) {
@@ -1247,6 +1275,9 @@ public final class OpenAiBridge {
                     }
 
                     async function refreshLogs() {
+                      if (!dashboardUnlocked) {
+                        return;
+                      }
                       try {
                         const [req, sys] = await Promise.all([
                           getJson('/dashboard/api/logs/requests'),
@@ -1258,7 +1289,10 @@ public final class OpenAiBridge {
                           dashboardAuthStatus.textContent = 'Unlocked';
                         }
                       } catch (err) {
-                        if (dashboardPasswordRequired) {
+                        if (dashboardPasswordRequired && dashboardUnlocked) {
+                          dashboardUnlocked = false;
+                          setProtectedVisible(false);
+                          setEndpointPlaceholders();
                           dashboardAuthStatus.textContent = 'Locked / wrong password';
                           document.getElementById('requestLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';
                           document.getElementById('systemLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';
@@ -1267,11 +1301,16 @@ public final class OpenAiBridge {
                     }
 
                     document.getElementById('send').onclick = async () => {
+                      if (!dashboardUnlocked) {
+                        document.getElementById('response').textContent = 'Unlock dashboard first.';
+                        return;
+                      }
                       const prompt = document.getElementById('prompt').value.trim();
                       if (!prompt) return;
                       const headers = { 'Content-Type': 'application/json' };
-                      if (defaultProxyApiKey) {
-                        headers['Authorization'] = 'Bearer ' + defaultProxyApiKey;
+                      const proxyKey = dashboardInfo && dashboardInfo.proxy_api_key ? dashboardInfo.proxy_api_key : '';
+                      if (proxyKey) {
+                        headers['Authorization'] = 'Bearer ' + proxyKey;
                       }
                       const payload = {
                         model: 'auto',
@@ -1294,13 +1333,17 @@ public final class OpenAiBridge {
                       refreshLogs();
                     };
 
-                    refreshLogs();
+                    if (dashboardPasswordRequired) {
+                      document.getElementById('requestLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';
+                      document.getElementById('systemLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';
+                    } else {
+                      unlockDashboard();
+                    }
                     setInterval(refreshLogs, 2500);
                   </script>
                 </body>
                 </html>
                 """)
-                .replace("__PROXY_API_KEY_JSON__", proxyKeyJson)
                 .replace("__DASHBOARD_PASSWORD_REQUIRED__", dashboardPasswordRequired);
     }
 
