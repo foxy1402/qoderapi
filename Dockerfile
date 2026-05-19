@@ -16,7 +16,7 @@ COPY baseprompt.json ./baseprompt.json
 
 RUN mvn -q -DskipTests package
 
-FROM eclipse-temurin:17-jre-alpine
+FROM eclipse-temurin:17-jre
 
 WORKDIR /app
 
