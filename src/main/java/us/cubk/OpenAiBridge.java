@@ -1243,6 +1243,7 @@ public final class OpenAiBridge {
                         setProtectedVisible(true);
                         if (dashboardPasswordRequired) {
                           dashboardAuthStatus.textContent = 'Unlocked';
+                          dashboardAuthCard.style.display = 'none';
                         }
                         await refreshLogs();
                       } catch (err) {
@@ -1250,6 +1251,7 @@ public final class OpenAiBridge {
                         setProtectedVisible(false);
                         setEndpointPlaceholders();
                         if (dashboardPasswordRequired) {
+                          dashboardAuthCard.style.display = '';
                           dashboardAuthStatus.textContent = 'Locked / wrong password';
                         }
                       }
@@ -1293,6 +1295,7 @@ public final class OpenAiBridge {
                           dashboardUnlocked = false;
                           setProtectedVisible(false);
                           setEndpointPlaceholders();
+                          dashboardAuthCard.style.display = '';
                           dashboardAuthStatus.textContent = 'Locked / wrong password';
                           document.getElementById('requestLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';
                           document.getElementById('systemLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';
@@ -1312,6 +1315,7 @@ public final class OpenAiBridge {
                       if (proxyKey) {
                         headers['Authorization'] = 'Bearer ' + proxyKey;
                       }
+                      const endpoint = document.getElementById('chatEndpoint').value;
                       const payload = {
                         model: 'auto',
                         stream: false,
