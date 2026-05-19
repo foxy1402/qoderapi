@@ -120,11 +120,6 @@ public final class OpenAiBridge {
                 ex.sendResponseHeaders(405, -1);
                 return;
             }
-            if (!isDashboardAuthorized(ex)) {
-                requestDashboardAuth(ex);
-                logSystem("Dashboard auth failed from " + ex.getRemoteAddress());
-                return;
-            }
             byte[] html = dashboardHtml().getBytes(StandardCharsets.UTF_8);
             applyCors(ex);
             ex.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
@@ -146,13 +141,14 @@ public final class OpenAiBridge {
                 return;
             }
             if (!isDashboardAuthorized(ex)) {
-                requestDashboardAuth(ex);
+                writeDashboardAuthError(ex);
                 return;
             }
             ObjectNode info = objectMapper.createObjectNode();
             info.put("dashboard_enabled", dashboardEnabled);
             info.put("cors_enabled", corsEnabled);
             info.put("api_key_required", requiresProxyApiKey());
+            info.put("endpoint_base_path", "/v1");
             info.put("endpoint_path", "/v1/chat/completions");
             info.put("model_note", "Model selector hidden. Bridge does not strictly enforce model IDs.");
             writeJson(ex, 200, info);
@@ -180,7 +176,7 @@ public final class OpenAiBridge {
                 return;
             }
             if (!isDashboardAuthorized(ex)) {
-                requestDashboardAuth(ex);
+                writeDashboardAuthError(ex);
                 return;
             }
             ArrayNode logs = objectMapper.createArrayNode();
@@ -1008,34 +1004,21 @@ public final class OpenAiBridge {
         writeJson(ex, 401, error);
     }
 
-    private void requestDashboardAuth(HttpExchange ex) throws IOException {
-        applyCors(ex);
-        ex.getResponseHeaders().set("WWW-Authenticate", "Basic realm=\"Qoder Dashboard\", charset=\"UTF-8\"");
-        byte[] body = "Dashboard authentication required".getBytes(StandardCharsets.UTF_8);
-        ex.sendResponseHeaders(401, body.length);
-        ex.getResponseBody().write(body);
-    }
-
     private boolean isDashboardAuthorized(HttpExchange ex) {
         if (dashboardPasswords.isEmpty()) {
             return true;
         }
         String direct = ex.getRequestHeaders().getFirst("X-Dashboard-Password");
-        if (direct != null && dashboardPasswords.contains(direct)) {
-            return true;
-        }
-        String auth = ex.getRequestHeaders().getFirst("Authorization");
-        if (auth == null || !auth.startsWith("Basic ")) {
-            return false;
-        }
-        try {
-            String decoded = new String(java.util.Base64.getDecoder().decode(auth.substring("Basic ".length()).trim()), StandardCharsets.UTF_8);
-            int idx = decoded.indexOf(':');
-            String password = idx >= 0 ? decoded.substring(idx + 1) : decoded;
-            return dashboardPasswords.contains(password);
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
+        return direct != null && dashboardPasswords.contains(direct);
+    }
+
+    private void writeDashboardAuthError(HttpExchange ex) throws IOException {
+        ObjectNode error = objectMapper.createObjectNode();
+        ObjectNode payload = objectMapper.createObjectNode();
+        payload.put("message", "Invalid or missing dashboard password");
+        payload.put("type", "dashboard_auth_error");
+        error.set("error", payload);
+        writeJson(ex, 401, error);
     }
 
     private List<String> resolveDashboardPasswords() {
@@ -1060,8 +1043,18 @@ public final class OpenAiBridge {
         ex.getResponseBody().write(bytes);
     }
 
+    private String jsonStringLiteral(String value) {
+        try {
+            return objectMapper.writeValueAsString(value == null ? "" : value);
+        } catch (Exception e) {
+            return "\"\"";
+        }
+    }
+
     private String dashboardHtml() {
-        return """
+        String proxyKeyJson = jsonStringLiteral(proxyApiKey);
+        String dashboardPasswordRequired = dashboardPasswords.isEmpty() ? "false" : "true";
+        return ("""
                 <!doctype html>
                 <html lang="en">
                 <head>
@@ -1127,6 +1120,13 @@ public final class OpenAiBridge {
                       border-radius: 10px;
                       font-weight: 600;
                     }
+                    .error {
+                      color: #fff;
+                      background: #7d2230;
+                      padding: 10px;
+                      border-radius: 10px;
+                      font-weight: 600;
+                    }
                     pre {
                       margin: 0;
                       background: #0b1119;
@@ -1150,8 +1150,17 @@ public final class OpenAiBridge {
                     <div class="card">
                       <h2>Endpoint</h2>
                       <div class="row">
-                        <div class="grow"><input id="endpoint" readonly></div>
-                        <div style="width: 180px;"><button id="copyEndpoint">Copy Endpoint</button></div>
+                        <div class="grow"><input id="baseUrl" readonly></div>
+                        <div style="width: 180px;"><button id="copyBaseUrl">Copy Base URL</button></div>
+                      </div>
+                      <div class="mini" style="margin-top: 8px;">Base URL ends at <code>/v1</code>.</div>
+                      <div class="row" style="margin-top: 8px;">
+                        <div class="grow"><input id="chatEndpoint" readonly></div>
+                        <div style="width: 180px;"><button id="copyEndpoint">Copy Chat Endpoint</button></div>
+                      </div>
+                      <div class="row" style="margin-top: 8px;">
+                        <div class="grow"><input id="proxyKey" readonly></div>
+                        <div style="width: 180px;"><button id="copyProxyKey">Copy API Key</button></div>
                       </div>
                       <div class="warn" style="margin-top: 10px;">
                         Warning: some online container platforms expose HTTPS URLs. Verify your client uses the correct scheme (https:// vs http://).
@@ -1159,11 +1168,18 @@ public final class OpenAiBridge {
                       <div class="mini" style="margin-top: 8px;">Model switch is hidden because this bridge does not strictly enforce model IDs.</div>
                     </div>
 
+                    <div class="card" id="dashboardAuthCard">
+                      <h2>Dashboard Access</h2>
+                      <div class="mini">Dashboard password is required for logs/info API. Enter password below to unlock data panels.</div>
+                      <div class="row" style="margin-top: 8px;">
+                        <div class="grow"><input id="dashboardPassword" type="password" placeholder="Dashboard password"></div>
+                        <div style="width: 180px;"><button id="unlockDashboard">Unlock</button></div>
+                      </div>
+                      <div id="dashboardAuthStatus" class="mini" style="margin-top: 8px;"></div>
+                    </div>
+
                     <div class="card">
                       <h2>Playground</h2>
-                      <div class="row">
-                        <div class="grow"><input id="apiKey" placeholder="Optional proxy API key (QODER_API_KEY)"></div>
-                      </div>
                       <textarea id="prompt" placeholder="Type a test prompt..."></textarea>
                       <div class="row" style="margin-top: 8px;">
                         <div style="width: 200px;"><button id="send">Send Test Chat</button></div>
@@ -1184,17 +1200,48 @@ public final class OpenAiBridge {
                   </div>
 
                   <script>
-                    const endpointInput = document.getElementById('endpoint');
-                    const endpoint = window.location.origin + '/v1/chat/completions';
-                    endpointInput.value = endpoint;
-                    document.getElementById('copyEndpoint').onclick = async () => {
+                    const apiBase = window.location.origin + '/v1';
+                    const endpoint = apiBase + '/chat/completions';
+                    const defaultProxyApiKey = __PROXY_API_KEY_JSON__;
+                    const dashboardPasswordRequired = __DASHBOARD_PASSWORD_REQUIRED__;
+                    let dashboardPassword = '';
+
+                    document.getElementById('baseUrl').value = apiBase;
+                    document.getElementById('chatEndpoint').value = endpoint;
+                    document.getElementById('proxyKey').value = defaultProxyApiKey || '(not configured)';
+
+                    async function copyText(text) {
                       try {
-                        await navigator.clipboard.writeText(endpoint);
+                        await navigator.clipboard.writeText(text);
                       } catch (err) {}
+                    }
+                    document.getElementById('copyBaseUrl').onclick = () => copyText(apiBase);
+                    document.getElementById('copyEndpoint').onclick = () => copyText(endpoint);
+                    document.getElementById('copyProxyKey').onclick = () => copyText(defaultProxyApiKey || '');
+
+                    const dashboardAuthCard = document.getElementById('dashboardAuthCard');
+                    const dashboardAuthStatus = document.getElementById('dashboardAuthStatus');
+                    if (!dashboardPasswordRequired) {
+                      dashboardAuthCard.style.display = 'none';
+                    } else {
+                      dashboardAuthStatus.textContent = 'Locked';
+                    }
+
+                    document.getElementById('unlockDashboard').onclick = async () => {
+                      dashboardPassword = document.getElementById('dashboardPassword').value.trim();
+                      await refreshLogs();
                     };
 
+                    function dashboardHeaders(base = {}) {
+                      const h = { ...base };
+                      if (dashboardPassword) {
+                        h['X-Dashboard-Password'] = dashboardPassword;
+                      }
+                      return h;
+                    }
+
                     async function getJson(url) {
-                      const res = await fetch(url, { credentials: 'same-origin' });
+                      const res = await fetch(url, { headers: dashboardHeaders(), credentials: 'same-origin' });
                       if (!res.ok) throw new Error('HTTP ' + res.status);
                       return res.json();
                     }
@@ -1207,16 +1254,24 @@ public final class OpenAiBridge {
                         ]);
                         document.getElementById('requestLogs').textContent = (req.logs || []).join('\\n');
                         document.getElementById('systemLogs').textContent = (sys.logs || []).join('\\n');
-                      } catch (err) {}
+                        if (dashboardPasswordRequired) {
+                          dashboardAuthStatus.textContent = 'Unlocked';
+                        }
+                      } catch (err) {
+                        if (dashboardPasswordRequired) {
+                          dashboardAuthStatus.textContent = 'Locked / wrong password';
+                          document.getElementById('requestLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';
+                          document.getElementById('systemLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';
+                        }
+                      }
                     }
 
                     document.getElementById('send').onclick = async () => {
                       const prompt = document.getElementById('prompt').value.trim();
-                      const apiKey = document.getElementById('apiKey').value.trim();
                       if (!prompt) return;
                       const headers = { 'Content-Type': 'application/json' };
-                      if (apiKey) {
-                        headers['Authorization'] = 'Bearer ' + apiKey;
+                      if (defaultProxyApiKey) {
+                        headers['Authorization'] = 'Bearer ' + defaultProxyApiKey;
                       }
                       const payload = {
                         model: 'auto',
@@ -1244,7 +1299,9 @@ public final class OpenAiBridge {
                   </script>
                 </body>
                 </html>
-                """;
+                """)
+                .replace("__PROXY_API_KEY_JSON__", proxyKeyJson)
+                .replace("__DASHBOARD_PASSWORD_REQUIRED__", dashboardPasswordRequired);
     }
 
     public static void run(String pat, int port) throws Exception {
