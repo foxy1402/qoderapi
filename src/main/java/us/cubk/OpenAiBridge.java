@@ -12,12 +12,14 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneOffset;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -26,15 +28,16 @@ import java.util.concurrent.ConcurrentLinkedDeque;
 public final class OpenAiBridge {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault());
     private static final int LOG_LIMIT = 300;
+    private static final Duration LOG_RETENTION = Duration.ofDays(3);
     private static final String CHUNK_TRUNCATION_1 = "premature end of chunk";
     private static final String CHUNK_TRUNCATION_2 = "closing chunk expected";
     private final BearerBuilder.SessionContext sess;
     private final BearerApiClient bearerClient;
     private final JsonNode templateBase;
-    private final Deque<String> requestLogs = new ConcurrentLinkedDeque<>();
-    private final Deque<String> systemLogs = new ConcurrentLinkedDeque<>();
+    private final Deque<LogEntry> requestLogs = new ConcurrentLinkedDeque<>();
+    private final Deque<LogEntry> systemLogs = new ConcurrentLinkedDeque<>();
     private final boolean dashboardEnabled = getBooleanSetting("DASHBOARD_ENABLED", true);
     private final boolean corsEnabled = getBooleanSetting("CORS_ENABLED", true);
     private final String corsAllowOrigin = getSettingOrDefault("CORS_ALLOW_ORIGIN", "*");
@@ -176,7 +179,7 @@ public final class OpenAiBridge {
         handleDashboardLogs(ex, systemLogs);
     }
 
-    private void handleDashboardLogs(HttpExchange ex, Deque<String> source) throws IOException {
+    private void handleDashboardLogs(HttpExchange ex, Deque<LogEntry> source) throws IOException {
         try {
             if (handleCorsPreflight(ex)) {
                 return;
@@ -190,9 +193,11 @@ public final class OpenAiBridge {
                 writeDashboardAuthError(ex);
                 return;
             }
+            purgeExpiredLogs(source, Instant.now());
             ArrayNode logs = objectMapper.createArrayNode();
-            for (String entry : source) {
-                logs.add(entry);
+            Iterator<LogEntry> iterator = source.descendingIterator();
+            while (iterator.hasNext()) {
+                logs.add(iterator.next().format());
             }
             ObjectNode payload = objectMapper.createObjectNode();
             payload.set("logs", logs);
@@ -1163,11 +1168,29 @@ public final class OpenAiBridge {
         appendLog(systemLogs, message);
     }
 
-    private void appendLog(Deque<String> queue, String message) {
-        String entry = LOG_TIME.format(Instant.now()) + " " + message;
-        queue.addLast(entry);
+    private void appendLog(Deque<LogEntry> queue, String message) {
+        Instant now = Instant.now();
+        purgeExpiredLogs(queue, now);
+        queue.addLast(new LogEntry(now, message));
         while (queue.size() > LOG_LIMIT) {
             queue.pollFirst();
+        }
+    }
+
+    private void purgeExpiredLogs(Deque<LogEntry> queue, Instant now) {
+        Instant cutoff = now.minus(LOG_RETENTION);
+        while (true) {
+            LogEntry first = queue.peekFirst();
+            if (first == null || !first.at().isBefore(cutoff)) {
+                break;
+            }
+            queue.pollFirst();
+        }
+    }
+
+    private record LogEntry(Instant at, String message) {
+        private String format() {
+            return LOG_TIME.format(at) + " " + message;
         }
     }
 
@@ -1497,10 +1520,18 @@ public final class OpenAiBridge {
                       }
                     }
 
-                    document.getElementById('unlockDashboard').onclick = async () => {
+                    async function performUnlock() {
                       dashboardPassword = document.getElementById('dashboardPassword').value.trim();
                       await unlockDashboard();
-                    };
+                    }
+
+                    document.getElementById('unlockDashboard').onclick = performUnlock;
+                    document.getElementById('dashboardPassword').addEventListener('keydown', async (ev) => {
+                      if (ev.key === 'Enter') {
+                        ev.preventDefault();
+                        await performUnlock();
+                      }
+                    });
 
                     function dashboardHeaders(base = {}) {
                       const h = { ...base };
@@ -1543,7 +1574,7 @@ public final class OpenAiBridge {
                       }
                     }
 
-                    document.getElementById('send').onclick = async () => {
+                    async function sendPlayground() {
                       if (!dashboardUnlocked) {
                         document.getElementById('response').textContent = 'Unlock dashboard first.';
                         return;
@@ -1575,7 +1606,15 @@ public final class OpenAiBridge {
                         out.textContent = String(err);
                       }
                       refreshLogs();
-                    };
+                    }
+
+                    document.getElementById('send').onclick = sendPlayground;
+                    document.getElementById('prompt').addEventListener('keydown', async (ev) => {
+                      if (ev.key === 'Enter' && !ev.shiftKey) {
+                        ev.preventDefault();
+                        await sendPlayground();
+                      }
+                    });
 
                     if (dashboardPasswordRequired) {
                       document.getElementById('requestLogs').textContent = 'Dashboard logs are locked. Enter dashboard password above.';

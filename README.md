@@ -177,6 +177,13 @@ So model routing should be considered loosely validated at the bridge layer.
 - Token usage fields are currently zeroed
 - No persistent storage (logs are in-memory and reset on restart)
 
+## In-Memory Log Retention
+
+- Dashboard request/system logs are stored in RAM only.
+- Logs are retained for up to 3 days.
+- A hard cap of 300 entries per log stream is also enforced.
+- Both rules apply: time-based purge runs first, then count-based trimming. Effective retention is up to 3 days but never more than 300 entries.
+
 ## Security Recommendations
 
 - Set `QODER_API_KEY` explicitly if exposing the service publicly
