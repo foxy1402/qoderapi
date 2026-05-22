@@ -17,6 +17,8 @@ OpenAI-compatible `/v1/chat/completions` bridge for Qoder backend, with built-in
 Only one variable is required:
 
 - `QODER_PAT` = your Qoder personal access token
+  - Single key: `QODER_PAT=pt-xxx`
+  - Multi key rotation: `QODER_PAT=pt-key1,pt-key2,pt-key3`
 
 ### Docker Run
 
@@ -80,13 +82,15 @@ After you create the GitHub repo, push this code and GitHub will publish the `la
 ### Upstream Auth (required)
 
 - `QODER_PAT` is used to authenticate bridge -> Qoder upstream.
+- Multiple PATs are supported via comma-separated values.
+- Bridge initializes one upstream route per PAT and rotates routes on upstream failure.
 
 ### Proxy Auth (optional, recommended for public deployment)
 
 For client -> bridge auth on `/v1/chat/completions`:
 
 - If `QODER_API_KEY` is set, it is required.
-- If `QODER_API_KEY` is not set, auth key defaults to `QODER_PAT`.
+- If `QODER_API_KEY` is not set, auth key defaults to the first PAT in `QODER_PAT`.
 
 Accepted headers:
 
@@ -114,7 +118,7 @@ CORS is enabled by default.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `QODER_PAT` | Yes | - | Required PAT for upstream Qoder auth |
+| `QODER_PAT` | Yes | - | One or more PATs (comma-separated) for upstream Qoder auth |
 | `QODER_HOST` | No | `127.0.0.1` | Bind host |
 | `QODER_PORT` | No | `8963` | Bind port |
 | `DASHBOARD_ENABLED` | No | `true` | Enable/disable dashboard routes |
@@ -131,6 +135,13 @@ CORS is enabled by default.
 - `off`: never emit `tool_calls`; always return text completion shape.
 - `auto` (recommended): emit `tool_calls` only when request includes a non-empty `tools` array.
 - `passthrough`: forward tool-call behavior even without client-provided `tools`.
+
+### PAT Rotation
+
+- When multiple PATs are configured, requests are routed in rotating order.
+- Existing per-call retry behavior is preserved.
+- On upstream `500/502/503/504`-type failures, bridge can fail over to the next PAT route in the same request.
+- Quota-like failures (`500` with quota/limit/exhausted signals) temporarily block that PAT route for 24 hours before reuse.
 
 ## Example Requests
 

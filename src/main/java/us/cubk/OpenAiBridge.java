@@ -24,6 +24,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class OpenAiBridge {
 
@@ -31,10 +33,15 @@ public final class OpenAiBridge {
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault());
     private static final int LOG_LIMIT = 300;
     private static final Duration LOG_RETENTION = Duration.ofDays(3);
+    private static final Duration PAT_QUOTA_BLOCK = Duration.ofHours(24);
     private static final String CHUNK_TRUNCATION_1 = "premature end of chunk";
     private static final String CHUNK_TRUNCATION_2 = "closing chunk expected";
-    private final BearerBuilder.SessionContext sess;
-    private final BearerApiClient bearerClient;
+    private static final String HTTP_500 = "http 500";
+    private static final String HTTP_502 = "http 502";
+    private static final String HTTP_503 = "http 503";
+    private static final String HTTP_504 = "http 504";
+    private final List<UpstreamRoute> upstreamRoutes;
+    private final AtomicInteger routeCursor = new AtomicInteger(0);
     private final JsonNode templateBase;
     private final Deque<LogEntry> requestLogs = new ConcurrentLinkedDeque<>();
     private final Deque<LogEntry> systemLogs = new ConcurrentLinkedDeque<>();
@@ -52,17 +59,13 @@ public final class OpenAiBridge {
     }
 
     public OpenAiBridge(String pat) throws Exception {
+        List<String> patKeys = splitPatKeys(pat);
+        if (patKeys.isEmpty()) {
+            throw new RuntimeException("Token required!");
+        }
         String explicitApiKey = getSetting("QODER_API_KEY");
-        this.proxyApiKey = (explicitApiKey == null || explicitApiKey.isBlank()) ? pat : explicitApiKey;
-        String mid = UUID.randomUUID().toString();
-        String mtoken = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString((UUID.randomUUID().toString() + UUID.randomUUID()).substring(0, 50).getBytes());
-        String mtype = UUID.randomUUID().toString().replace("-", "").substring(0, 18);
-        var sigClient = new SignatureApiClient(mid, mtoken, mtype);
-        JsonNode jt = sigClient.exchangeJobToken(pat);
-        System.out.println("[bridge] session for " + jt.path("name").asText() + " (" + jt.path("id").asText() + ")");
-        var identity = new BearerBuilder.AuthIdentity(jt.path("name").asText(""), jt.path("id").asText(""), jt.path("id").asText(""), "", "", "", jt.path("userType").asText("personal_standard"), jt.path("securityOauthToken").asText(), jt.path("refreshToken").asText());
-        this.sess = BearerBuilder.newSession(identity, mid, mtoken, mtype);
-        this.bearerClient = new BearerApiClient(sess);
+        this.proxyApiKey = (explicitApiKey == null || explicitApiKey.isBlank()) ? patKeys.get(0) : explicitApiKey;
+        this.upstreamRoutes = initializeUpstreamRoutes(patKeys);
         String basePrompt = new String(java.nio.file.Files.readAllBytes(new File("baseprompt.json").toPath()));
         basePrompt = basePrompt.replace("{UUID1}", UUID.randomUUID().toString());
         basePrompt = basePrompt.replace("{UUID2}", UUID.randomUUID().toString());
@@ -71,7 +74,8 @@ public final class OpenAiBridge {
         basePrompt = basePrompt.replace("{UUID5}", UUID.randomUUID().toString());
         basePrompt = basePrompt.replace("{TIME1}", String.valueOf(System.currentTimeMillis()));
         this.templateBase = objectMapper.readTree(basePrompt);
-        logSystem("Bridge initialized for user=" + jt.path("id").asText() + " dashboardEnabled=" + dashboardEnabled + " corsEnabled=" + corsEnabled + " apiKeyAuth=" + (proxyApiKey != null && !proxyApiKey.isBlank()) + " toolMode=" + toolMode.name().toLowerCase());
+        UpstreamRoute primary = upstreamRoutes.get(0);
+        logSystem("Bridge initialized routes=" + upstreamRoutes.size() + " primaryUser=" + primary.userId + " dashboardEnabled=" + dashboardEnabled + " corsEnabled=" + corsEnabled + " apiKeyAuth=" + (proxyApiKey != null && !proxyApiKey.isBlank()) + " toolMode=" + toolMode.name().toLowerCase());
     }
 
     public void start(int port) throws Exception {
@@ -257,7 +261,7 @@ public final class OpenAiBridge {
             body.put("request_set_id", UUID.randomUUID().toString());
             body.put("session_id", UUID.randomUUID().toString());
             body.put("stream", true);
-            body.put("aliyun_user_type", sess.identity().userType());
+            body.put("aliyun_user_type", primaryRoute().session.identity().userType());
             ObjectNode mc = (ObjectNode) body.path("model_config");
             mc.put("key", model);
             ObjectNode biz = (ObjectNode) body.path("business");
@@ -474,12 +478,44 @@ public final class OpenAiBridge {
     }
 
     private void executeUpstreamLinesWithRetry(String url, ObjectNode body, Map<String, String> extraHeaders, java.util.function.Consumer<String> onLine, boolean retryOnChunkTruncation, boolean onlyRetryIfNoLines) throws Exception {
+        List<UpstreamRoute> candidates = orderedRouteCandidates(Instant.now());
+        if (candidates.isEmpty()) {
+            throw new RuntimeException("No available QODER_PAT routes (all temporarily blocked)");
+        }
+        Exception last = null;
+        for (int i = 0; i < candidates.size(); i++) {
+            UpstreamRoute route = candidates.get(i);
+            try {
+                executeWithRouteChunkRetry(route, url, body, extraHeaders, onLine, retryOnChunkTruncation, onlyRetryIfNoLines);
+                routeCursor.set((routeCursor.get() + i + 1) % upstreamRoutes.size());
+                return;
+            } catch (Exception e) {
+                last = e;
+                if (isQuotaExhaustedLikeError(e)) {
+                    route.blockUntil(Instant.now().plus(PAT_QUOTA_BLOCK));
+                    logSystem("route_exhausted user=" + route.userId + " blockedUntil=" + LOG_TIME.format(Instant.ofEpochMilli(route.blockedUntilMillis.get())) + " reason=" + sanitizeErrorForLog(e));
+                }
+                boolean canRotate = i < candidates.size() - 1 && isRotatableUpstreamFailure(e);
+                if (!canRotate) {
+                    throw e;
+                }
+                logSystem("route_rotate fromUser=" + route.userId + " reason=" + sanitizeErrorForLog(e));
+            }
+        }
+        if (last != null) {
+            throw last;
+        }
+    }
+
+    private void executeWithRouteChunkRetry(UpstreamRoute route, String url, ObjectNode body, Map<String, String> extraHeaders, java.util.function.Consumer<String> onLine, boolean retryOnChunkTruncation, boolean onlyRetryIfNoLines) throws Exception {
         int maxAttempts = retryOnChunkTruncation ? 2 : 1;
         Exception last = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             final boolean[] sawLines = {false};
+            ObjectNode routeBody = body.deepCopy();
+            routeBody.put("aliyun_user_type", route.session.identity().userType());
             try {
-                bearerClient.openStreamLines(url, body, extraHeaders, line -> {
+                route.client.openStreamLines(url, routeBody, extraHeaders, line -> {
                     sawLines[0] = true;
                     onLine.accept(line);
                 });
@@ -490,7 +526,7 @@ public final class OpenAiBridge {
                 if (!canRetry) {
                     throw e;
                 }
-                logSystem("upstream_chunk_truncated retrying attempt=" + attempt + " of " + maxAttempts);
+                logSystem("upstream_chunk_truncated retrying attempt=" + attempt + " of " + maxAttempts + " user=" + route.userId);
                 try {
                     Thread.sleep(200L);
                 } catch (InterruptedException ie) {
@@ -548,6 +584,123 @@ public final class OpenAiBridge {
             cur = cur.getCause();
         }
         return false;
+    }
+
+    private boolean isRotatableUpstreamFailure(Exception e) {
+        if (e == null) {
+            return false;
+        }
+        String lower = flattenError(e);
+        return lower.contains(HTTP_500) || lower.contains(HTTP_502) || lower.contains(HTTP_503) || lower.contains(HTTP_504) || lower.contains("stream timeout") || lower.contains("connect timed out");
+    }
+
+    private boolean isQuotaExhaustedLikeError(Exception e) {
+        if (e == null) {
+            return false;
+        }
+        String lower = flattenError(e);
+        if (!(lower.contains(HTTP_500) || lower.contains("quota"))) {
+            return false;
+        }
+        return lower.contains("quota")
+                || lower.contains("limit")
+                || lower.contains("exhaust")
+                || lower.contains("daily")
+                || lower.contains("cap");
+    }
+
+    private String sanitizeErrorForLog(Exception e) {
+        String msg = e == null ? "unknown" : (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+        msg = msg.replace('\n', ' ').replace('\r', ' ').trim();
+        return msg.length() > 220 ? msg.substring(0, 220) + "..." : msg;
+    }
+
+    private String flattenError(Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        Throwable cur = t;
+        while (cur != null) {
+            String msg = cur.getMessage();
+            if (msg != null && !msg.isBlank()) {
+                if (sb.length() > 0) sb.append(" | ");
+                sb.append(msg.toLowerCase());
+            }
+            cur = cur.getCause();
+        }
+        return sb.toString();
+    }
+
+    private UpstreamRoute primaryRoute() {
+        return upstreamRoutes.get(0);
+    }
+
+    private List<UpstreamRoute> orderedRouteCandidates(Instant now) {
+        List<UpstreamRoute> active = new ArrayList<>();
+        List<UpstreamRoute> blocked = new ArrayList<>();
+        int start = Math.floorMod(routeCursor.get(), upstreamRoutes.size());
+        for (int i = 0; i < upstreamRoutes.size(); i++) {
+            UpstreamRoute route = upstreamRoutes.get((start + i) % upstreamRoutes.size());
+            if (route.isAvailable(now)) {
+                active.add(route);
+            } else {
+                blocked.add(route);
+            }
+        }
+        if (!active.isEmpty()) {
+            return active;
+        }
+        // Fallback: if all are blocked, allow trying blocked routes in rotation order.
+        return blocked;
+    }
+
+    private List<UpstreamRoute> initializeUpstreamRoutes(List<String> patKeys) throws Exception {
+        List<UpstreamRoute> routes = new ArrayList<>();
+        List<String> failures = new ArrayList<>();
+        for (int i = 0; i < patKeys.size(); i++) {
+            String pat = patKeys.get(i);
+            try {
+                UpstreamRoute route = createRoute(pat, i);
+                routes.add(route);
+                logSystem("route_ready index=" + i + " user=" + route.userId);
+            } catch (Exception e) {
+                failures.add("index=" + i + " error=" + sanitizeErrorForLog(e));
+                logSystem("route_init_failed index=" + i + " error=" + sanitizeErrorForLog(e));
+            }
+        }
+        if (routes.isEmpty()) {
+            throw new RuntimeException("Failed to initialize any QODER_PAT route: " + String.join("; ", failures));
+        }
+        return List.copyOf(routes);
+    }
+
+    private UpstreamRoute createRoute(String pat, int index) throws Exception {
+        String mid = UUID.randomUUID().toString();
+        String mtoken = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString((UUID.randomUUID().toString() + UUID.randomUUID()).substring(0, 50).getBytes());
+        String mtype = UUID.randomUUID().toString().replace("-", "").substring(0, 18);
+        var sigClient = new SignatureApiClient(mid, mtoken, mtype);
+        JsonNode jt = sigClient.exchangeJobToken(pat);
+        System.out.println("[bridge] session[" + index + "] for " + jt.path("name").asText() + " (" + jt.path("id").asText() + ")");
+        var identity = new BearerBuilder.AuthIdentity(
+                jt.path("name").asText(""),
+                jt.path("id").asText(""),
+                jt.path("id").asText(""),
+                "",
+                "",
+                "",
+                jt.path("userType").asText("personal_standard"),
+                jt.path("securityOauthToken").asText(),
+                jt.path("refreshToken").asText());
+        BearerBuilder.SessionContext session = BearerBuilder.newSession(identity, mid, mtoken, mtype);
+        return new UpstreamRoute(index, jt.path("id").asText("unknown"), session, new BearerApiClient(session));
+    }
+
+    private List<String> splitPatKeys(String raw) {
+        if (raw == null) {
+            return List.of();
+        }
+        return Arrays.stream(raw.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isBlank())
+                .toList();
     }
 
     private String extractLatestUserPrompt(JsonNode messages) {
@@ -1191,6 +1344,29 @@ public final class OpenAiBridge {
     private record LogEntry(Instant at, String message) {
         private String format() {
             return LOG_TIME.format(at) + " " + message;
+        }
+    }
+
+    private static final class UpstreamRoute {
+        private final int index;
+        private final String userId;
+        private final BearerBuilder.SessionContext session;
+        private final BearerApiClient client;
+        private final AtomicLong blockedUntilMillis = new AtomicLong(0L);
+
+        private UpstreamRoute(int index, String userId, BearerBuilder.SessionContext session, BearerApiClient client) {
+            this.index = index;
+            this.userId = userId;
+            this.session = session;
+            this.client = client;
+        }
+
+        private boolean isAvailable(Instant now) {
+            return blockedUntilMillis.get() <= now.toEpochMilli();
+        }
+
+        private void blockUntil(Instant until) {
+            blockedUntilMillis.set(until.toEpochMilli());
         }
     }
 
