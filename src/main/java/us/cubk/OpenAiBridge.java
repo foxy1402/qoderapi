@@ -262,7 +262,6 @@ public final class OpenAiBridge {
             body.put("request_set_id", UUID.randomUUID().toString());
             body.put("session_id", UUID.randomUUID().toString());
             body.put("stream", true);
-            body.put("aliyun_user_type", primaryRoute().session.identity().userType());
             ObjectNode mc = (ObjectNode) body.path("model_config");
             mc.put("key", model);
             ObjectNode biz = (ObjectNode) body.path("business");
@@ -480,9 +479,6 @@ public final class OpenAiBridge {
 
     private void executeUpstreamLinesWithRetry(String url, ObjectNode body, Map<String, String> extraHeaders, java.util.function.Consumer<String> onLine, boolean retryOnChunkTruncation, boolean onlyRetryIfNoLines) throws Exception {
         List<UpstreamRoute> candidates = orderedRouteCandidates(Instant.now());
-        if (candidates.isEmpty()) {
-            throw new RuntimeException("No available QODER_PAT routes (all temporarily blocked)");
-        }
         Exception last = null;
         for (int i = 0; i < candidates.size(); i++) {
             UpstreamRoute route = candidates.get(i);
@@ -646,21 +642,23 @@ public final class OpenAiBridge {
 
     private List<UpstreamRoute> orderedRouteCandidates(Instant now) {
         List<UpstreamRoute> active = new ArrayList<>();
-        List<UpstreamRoute> blocked = new ArrayList<>();
+        UpstreamRoute firstBlocked = null;
         int start = Math.floorMod(routeCursor.get(), upstreamRoutes.size());
         for (int i = 0; i < upstreamRoutes.size(); i++) {
             UpstreamRoute route = upstreamRoutes.get((start + i) % upstreamRoutes.size());
             if (route.isAvailable(now)) {
                 active.add(route);
-            } else {
-                blocked.add(route);
+            } else if (firstBlocked == null) {
+                firstBlocked = route;
             }
         }
         if (!active.isEmpty()) {
             return active;
         }
-        // Fallback: if all are blocked, allow trying blocked routes in rotation order.
-        return blocked;
+        // All routes are blocked. Try only the first in rotation order as a last resort.
+        // Returning all blocked routes causes N×upstream-hang time when all PATs are exhausted;
+        // returning just one bounds the worst-case hang to a single route's retry window (~2 min).
+        return firstBlocked != null ? List.of(firstBlocked) : List.of();
     }
 
     private List<UpstreamRoute> initializeUpstreamRoutes(List<String> patKeys) throws Exception {
