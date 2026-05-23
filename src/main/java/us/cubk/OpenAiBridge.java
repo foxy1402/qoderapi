@@ -34,6 +34,7 @@ public final class OpenAiBridge {
     private static final int LOG_LIMIT = 300;
     private static final Duration LOG_RETENTION = Duration.ofDays(3);
     private static final Duration PAT_QUOTA_BLOCK = Duration.ofHours(24);
+    private static final Duration PAT_CHUNK_BACKOFF = PAT_QUOTA_BLOCK; // quota resets daily
     private static final String CHUNK_TRUNCATION_1 = "premature end of chunk";
     private static final String CHUNK_TRUNCATION_2 = "closing chunk expected";
     private static final String HTTP_500 = "http 500";
@@ -485,8 +486,9 @@ public final class OpenAiBridge {
         Exception last = null;
         for (int i = 0; i < candidates.size(); i++) {
             UpstreamRoute route = candidates.get(i);
+            boolean hasAlternatives = i < candidates.size() - 1;
             try {
-                executeWithRouteChunkRetry(route, url, body, extraHeaders, onLine, retryOnChunkTruncation, onlyRetryIfNoLines);
+                executeWithRouteChunkRetry(route, url, body, extraHeaders, onLine, retryOnChunkTruncation, onlyRetryIfNoLines, hasAlternatives);
                 routeCursor.set((routeCursor.get() + i + 1) % upstreamRoutes.size());
                 return;
             } catch (Exception e) {
@@ -494,8 +496,11 @@ public final class OpenAiBridge {
                 if (isQuotaExhaustedLikeError(e)) {
                     route.blockUntil(Instant.now().plus(PAT_QUOTA_BLOCK));
                     logSystem("route_exhausted user=" + route.userId + " blockedUntil=" + LOG_TIME.format(Instant.ofEpochMilli(route.blockedUntilMillis.get())) + " reason=" + sanitizeErrorForLog(e));
+                } else if (isChunkTruncationError(e)) {
+                    route.blockUntil(Instant.now().plus(PAT_CHUNK_BACKOFF));
+                    logSystem("route_chunk_backoff user=" + route.userId + " backoffUntil=" + LOG_TIME.format(Instant.ofEpochMilli(route.blockedUntilMillis.get())) + " reason=" + sanitizeErrorForLog(e));
                 }
-                boolean canRotate = i < candidates.size() - 1 && isRotatableUpstreamFailure(e);
+                boolean canRotate = hasAlternatives && isRotatableUpstreamFailure(e);
                 if (!canRotate) {
                     throw e;
                 }
@@ -507,7 +512,7 @@ public final class OpenAiBridge {
         }
     }
 
-    private void executeWithRouteChunkRetry(UpstreamRoute route, String url, ObjectNode body, Map<String, String> extraHeaders, java.util.function.Consumer<String> onLine, boolean retryOnChunkTruncation, boolean onlyRetryIfNoLines) throws Exception {
+    private void executeWithRouteChunkRetry(UpstreamRoute route, String url, ObjectNode body, Map<String, String> extraHeaders, java.util.function.Consumer<String> onLine, boolean retryOnChunkTruncation, boolean onlyRetryIfNoLines, boolean hasAlternatives) throws Exception {
         int maxAttempts = retryOnChunkTruncation ? 2 : 1;
         Exception last = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -522,7 +527,12 @@ public final class OpenAiBridge {
                 return;
             } catch (Exception e) {
                 last = e;
-                boolean canRetry = retryOnChunkTruncation && attempt < maxAttempts && isChunkTruncationError(e) && (!onlyRetryIfNoLines || !sawLines[0]);
+                // When another route is available, skip the within-route retry and let the
+                // outer loop rotate immediately. This avoids the extra ~1 min hang per retry
+                // caused by Qoder holding the connection before closing it with truncation.
+                boolean canRetry = retryOnChunkTruncation && attempt < maxAttempts && isChunkTruncationError(e)
+                        && (!onlyRetryIfNoLines || !sawLines[0])
+                        && !hasAlternatives;
                 if (!canRetry) {
                     throw e;
                 }
@@ -591,7 +601,8 @@ public final class OpenAiBridge {
             return false;
         }
         String lower = flattenError(e);
-        return lower.contains(HTTP_500) || lower.contains(HTTP_502) || lower.contains(HTTP_503) || lower.contains(HTTP_504) || lower.contains("stream timeout") || lower.contains("connect timed out");
+        return lower.contains(HTTP_500) || lower.contains(HTTP_502) || lower.contains(HTTP_503) || lower.contains(HTTP_504) || lower.contains("stream timeout") || lower.contains("connect timed out")
+                || isChunkTruncationError(e);
     }
 
     private boolean isQuotaExhaustedLikeError(Exception e) {
