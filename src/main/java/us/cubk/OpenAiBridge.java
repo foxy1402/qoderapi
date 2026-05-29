@@ -52,6 +52,7 @@ public final class OpenAiBridge {
     private final String proxyApiKey;
     private final List<String> dashboardPasswords = resolveDashboardPasswords();
     private final ToolMode toolMode = resolveToolMode();
+    private final long sessionRefreshIntervalMillis;
 
     private enum ToolMode {
         OFF,
@@ -66,6 +67,8 @@ public final class OpenAiBridge {
         }
         String explicitApiKey = getSetting("QODER_API_KEY");
         this.proxyApiKey = (explicitApiKey == null || explicitApiKey.isBlank()) ? patKeys.get(0) : explicitApiKey;
+        long refreshHours = getLongSettingOrDefault("QODER_SESSION_REFRESH_HOURS", 20L);
+        this.sessionRefreshIntervalMillis = Duration.ofHours(Math.max(1L, refreshHours)).toMillis();
         this.upstreamRoutes = initializeUpstreamRoutes(patKeys);
         String basePrompt = new String(java.nio.file.Files.readAllBytes(new File("baseprompt.json").toPath()));
         basePrompt = basePrompt.replace("{UUID1}", UUID.randomUUID().toString());
@@ -76,7 +79,7 @@ public final class OpenAiBridge {
         basePrompt = basePrompt.replace("{TIME1}", String.valueOf(System.currentTimeMillis()));
         this.templateBase = objectMapper.readTree(basePrompt);
         UpstreamRoute primary = upstreamRoutes.get(0);
-        logSystem("Bridge initialized routes=" + upstreamRoutes.size() + " primaryUser=" + primary.userId + " dashboardEnabled=" + dashboardEnabled + " corsEnabled=" + corsEnabled + " apiKeyAuth=" + (proxyApiKey != null && !proxyApiKey.isBlank()) + " toolMode=" + toolMode.name().toLowerCase());
+        logSystem("Bridge initialized routes=" + upstreamRoutes.size() + " primaryUser=" + primary.userId + " dashboardEnabled=" + dashboardEnabled + " corsEnabled=" + corsEnabled + " apiKeyAuth=" + (proxyApiKey != null && !proxyApiKey.isBlank()) + " toolMode=" + toolMode.name().toLowerCase() + " sessionRefreshHours=" + (sessionRefreshIntervalMillis / 3_600_000L));
     }
 
     public void start(int port) throws Exception {
@@ -97,6 +100,31 @@ public final class OpenAiBridge {
         server.start();
         System.out.println("[bridge] listening http://" + host + ":" + port + "/v1/chat/completions");
         logSystem("Server listening on http://" + host + ":" + port + " dashboard=" + dashboardEnabled);
+        startSessionRefreshThread();
+    }
+
+    private void startSessionRefreshThread() {
+        Thread t = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(sessionRefreshIntervalMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                for (UpstreamRoute route : upstreamRoutes) {
+                    try {
+                        route.refreshSession();
+                        logSystem("session_refreshed user=" + route.userId + " index=" + route.index);
+                    } catch (Exception e) {
+                        logSystem("session_refresh_failed user=" + route.userId + " index=" + route.index + " error=" + sanitizeErrorForLog(e));
+                    }
+                }
+            }
+        }, "session-refresh");
+        t.setDaemon(true);
+        t.start();
+        logSystem("session_refresh_scheduled intervalHours=" + (sessionRefreshIntervalMillis / 3_600_000L));
     }
 
     private void handleRoot(HttpExchange ex) throws IOException {
@@ -483,6 +511,14 @@ public final class OpenAiBridge {
         for (int i = 0; i < candidates.size(); i++) {
             UpstreamRoute route = candidates.get(i);
             boolean hasAlternatives = i < candidates.size() - 1;
+            if (route.isSessionStale(sessionRefreshIntervalMillis)) {
+                try {
+                    route.refreshSession();
+                    logSystem("session_refreshed_on_demand user=" + route.userId + " index=" + route.index);
+                } catch (Exception refreshErr) {
+                    logSystem("session_refresh_failed_on_demand user=" + route.userId + " index=" + route.index + " error=" + sanitizeErrorForLog(refreshErr));
+                }
+            }
             try {
                 executeWithRouteChunkRetry(route, url, body, extraHeaders, onLine, retryOnChunkTruncation, onlyRetryIfNoLines, hasAlternatives);
                 routeCursor.set((routeCursor.get() + i + 1) % upstreamRoutes.size());
@@ -513,10 +549,14 @@ public final class OpenAiBridge {
         Exception last = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             final boolean[] sawLines = {false};
+            // Snapshot volatile fields so a concurrent session refresh mid-attempt
+            // doesn't produce a mismatched session+client pair within one request.
+            BearerBuilder.SessionContext sess = route.session;
+            BearerApiClient cli = route.client;
             ObjectNode routeBody = body.deepCopy();
-            routeBody.put("aliyun_user_type", route.session.identity().userType());
+            routeBody.put("aliyun_user_type", sess.identity().userType());
             try {
-                route.client.openStreamLines(url, routeBody, extraHeaders, line -> {
+                cli.openStreamLines(url, routeBody, extraHeaders, line -> {
                     sawLines[0] = true;
                     onLine.accept(line);
                 });
@@ -699,7 +739,7 @@ public final class OpenAiBridge {
                 jt.path("securityOauthToken").asText(),
                 jt.path("refreshToken").asText());
         BearerBuilder.SessionContext session = BearerBuilder.newSession(identity, mid, mtoken, mtype);
-        return new UpstreamRoute(index, jt.path("id").asText("unknown"), session, new BearerApiClient(session));
+        return new UpstreamRoute(index, jt.path("id").asText("unknown"), pat, mid, mtoken, mtype, session, new BearerApiClient(session));
     }
 
     private List<String> splitPatKeys(String raw) {
@@ -1359,15 +1399,46 @@ public final class OpenAiBridge {
     private static final class UpstreamRoute {
         private final int index;
         private final String userId;
-        private final BearerBuilder.SessionContext session;
-        private final BearerApiClient client;
+        private final String pat;
+        private final String machineId;
+        private final String machineToken;
+        private final String machineType;
+        private volatile BearerBuilder.SessionContext session;
+        private volatile BearerApiClient client;
         private final AtomicLong blockedUntilMillis = new AtomicLong(0L);
+        private volatile long sessionRefreshedAtMillis;
 
-        private UpstreamRoute(int index, String userId, BearerBuilder.SessionContext session, BearerApiClient client) {
+        private UpstreamRoute(int index, String userId, String pat, String machineId, String machineToken, String machineType, BearerBuilder.SessionContext session, BearerApiClient client) {
             this.index = index;
             this.userId = userId;
+            this.pat = pat;
+            this.machineId = machineId;
+            this.machineToken = machineToken;
+            this.machineType = machineType;
             this.session = session;
             this.client = client;
+            this.sessionRefreshedAtMillis = System.currentTimeMillis();
+        }
+
+        private synchronized void refreshSession() throws Exception {
+            var sigClient = new SignatureApiClient(machineId, machineToken, machineType);
+            JsonNode jt = sigClient.exchangeJobToken(pat);
+            var identity = new BearerBuilder.AuthIdentity(
+                    jt.path("name").asText(""),
+                    jt.path("id").asText(""),
+                    jt.path("id").asText(""),
+                    "", "", "",
+                    jt.path("userType").asText("personal_standard"),
+                    jt.path("securityOauthToken").asText(),
+                    jt.path("refreshToken").asText());
+            BearerBuilder.SessionContext newSession = BearerBuilder.newSession(identity, machineId, machineToken, machineType);
+            this.session = newSession;
+            this.client = new BearerApiClient(newSession);
+            this.sessionRefreshedAtMillis = System.currentTimeMillis();
+        }
+
+        private boolean isSessionStale(long maxAgeMillis) {
+            return System.currentTimeMillis() - sessionRefreshedAtMillis > maxAgeMillis;
         }
 
         private boolean isAvailable(Instant now) {
@@ -1838,6 +1909,18 @@ public final class OpenAiBridge {
             return fallback;
         }
         return value;
+    }
+
+    private static long getLongSettingOrDefault(String key, long fallback) {
+        String value = getSetting(key);
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 
     private static boolean getBooleanSetting(String key, boolean fallback) {
